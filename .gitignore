@@ -1,0 +1,55 @@
+# Build outputs
+build/
+*/build/
+cmake-build-*/
+out/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.dtb
+*.a
+*.so
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 3rdparty prebuilt binaries (keep headers only)
+3rdparty/*/Linux/
+3rdparty/*/android/
+3rdparty/opencv/
+
+# SDK kernel/buildroot/rkbin
+rv1106-sdk/
+SDK/
+
+# Toolchains
+tools/
+toolchain/
+
+# Large models
+*.rknn
+kws_model/
+
+# Upload test binaries
+*.bin
+!README.md
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Temp
+tmp/
+temp/
+DeskBot_demo/lvgl/*.zip
