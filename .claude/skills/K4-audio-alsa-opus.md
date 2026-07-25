@@ -84,7 +84,7 @@ Playback:          │ [░░░░░░░░░░░░░░░░░░�
 
 ```
 PCM 16kHz 16bit mono:
-  40ms 帧 = 640 samples × 2 bytes = 1280 bytes/帧
+  40ms 帧 = 640 samples × 2 bytes = 1280 bytes/帧 1kb左右
 
 Opus encode:
   1280 bytes → ~80 bytes (压缩比 ~16:1)
