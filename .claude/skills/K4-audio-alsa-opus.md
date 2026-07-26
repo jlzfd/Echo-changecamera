@@ -227,6 +227,99 @@ ALSA: snd_pcm_writei (PortAudio 内部) → DMA: DDR → I2S TX FIFO → DAC →
 
 ---
 
+## 5a. 数据流参数
+
+### 基础参数
+
+```
+采样率:    16000 Hz
+位深:      16 bit (paInt16, S16_LE)
+通道:      1 (mono, RV1106 内置 codec 只有单路 ADC)
+帧长:     40ms (Opus 最优帧长, 延迟&压缩效率平衡)
+```
+
+### 帧参数
+
+```
+1 帧 = 16kHz × 0.04s = 640 samples
+1 帧 = 640 × 16bit × 1ch = 1280 bytes (PCM)
+1 秒 = 1000ms / 40ms = 25 帧
+
+"帧" = PortAudio 一次回调处理的数据单元
+"样本" = ADC 在某一瞬间量化的一个电平值
+每秒总样本数 = 25 帧/秒 × 640 样本/帧 = 16000 samples = 16kHz ✓
+```
+
+### ALSA buffer 三层结构
+
+```
+内核 DMA buffer:   16KB (DTS bootargs prealloc_buffer, 一次性分配)
+ALSA ring buffer:  ~5KB (4 periods × 640 samples = 2560 samples ≈ 5KB)
+应用层帧 buffer:   1280 bytes (640 samples, 回调粒度, 每次一个 period)
+```
+
+**应用层 buffer (1280 bytes) < ALSA ring buffer (5KB)** 的原因：DMA 写满 4 个 period 期间, 我们有 4 次回调机会消费数据。反过来如果应用层一次搬空整个 ring buffer, 两次回调之间 DMA 没地方写 → xrun。
+
+### 为什么是 4 个 period
+
+```
+2 个 period 最坏情况:
+  period0: DMA 正在写, period1: 用户读到一半
+  → DMA 追上读指针 → underrun → xrun
+
+4 个 period:
+  period0: DMA 写, period1: 备取, period2-3: 用户在消费
+  → DMA 和用户之间有 2 个 period 余量 → 安全
+```
+
+### 录音和播放独立异步
+
+```
+recordStream 和 playbackStream 是两个独立的 PortAudio stream
+各自有独立的 ALSA ring buffer, 不要求对齐
+I2S0 全双工: RX(录音) 和 TX(播放) 同时工作
+
+关联点: 共用同一个 AudioProcess 对象上的应用层队列
+  recordedAudioQueue: PortAudio 回调 push → 消费者 pop (mutex + cv)
+  playbackQueue:      网络收到 push → PortAudio 回调 pop (mutex)
+```
+
+### 数据量变化
+
+```
+原始 PCM (40ms): 1280 bytes (640 samples × 16bit × 1ch)
+Opus 编码后:     ~80 bytes  (压缩比 ~16:1)
+WebSocket 帧:    ~100 bytes (+ 协议头)
+
+每秒: 25 帧 × 1280 bytes = 32KB/s PCM
+     → 25 × 80 = 2KB/s Opus
+     → WiFi 轻松负担
+
+录音队列上限: 750 帧 × 1280 = 960KB (30s 缓冲, 满了丢旧帧)
+播放队列:     无上限 (网络及时就行)
+```
+
+### 回调模式, 不是阻塞模式
+
+```
+Pa_StartStream → 内部线程接管 ALSA → 立即返回
+
+PortAudio 内部线程:
+  while(streaming) {
+      snd_pcm_readi(rb, 640);           // 阻塞等一个 period 就绪
+      recordCallback(inputBuffer, ...);  // 调我们的回调 (同步, 必须快)
+  }
+
+我们的回调: lock → push → notify_one → unlock → return paContinue
+            ↑ 不能阻塞太久, 否则 xrun
+
+录音不写文件 — 纯内存流转:
+  回调 → 队列 → KWS/Opus encode → WebSocket
+  只有唤醒音效读文件: loadAudioFromFile("waked.pcm")
+```
+
+---
+
 ## 6. 我的项目中使用
 
 ### 6.1 录音链路（KWS + 语音识别）
