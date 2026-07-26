@@ -227,6 +227,104 @@ ioctl(fd, VIDIOC_STREAMOFF, &type);  // 停止
 
 ---
 
+## 5a. 数据流参数
+
+### ISP 输出参数
+
+```
+分辨率:     640×480 (ISP 原生输出)
+像素格式:   NV12 (YUV420SP, V4L2_PIX_FMT_NV12)
+  Y 平面:   640×480 = 307,200 bytes
+  UV 平面:  640×240 = 153,600 bytes
+单帧大小:   460,800 bytes (450KB)
+帧率:       30fps (ISP 硬件固定)
+位深:       8bit (NV12 每个分量 1 byte)
+```
+
+### V4L2 buffer 配置
+
+```
+REQBUFS:    4 个 MMAP buffer
+单 buffer:   450KB
+总 DMA:      450KB × 4 = 1.8MB
+
+buffer 状态机:
+  QUEUED → ACTIVE → DONE → QUEUED
+    ↑       ↑         ↑       ↑
+   用户     ISP 正在   ISP    用户
+   QBUF    填充      填完     DQBUF
+
+4 个 buffer 原因:
+  3 个: 无缓冲余量, DQBUF 卡一下 ISP 跟着卡
+  4 个: 至少 1 个空闲, ISP 可以 fill ahead
+  buffer[n] 被 DQBUF 拿走期间 ISP 仍有 buffer[n+1..n+3] 可用
+```
+
+### EXPBUF 预导出
+
+```
+数量:    4 个 fd (跟 V4L2 buffer 一一对应)
+时机:    初始化时一次性导出, 存入 exported_fd[i]
+运行时:  DQBUF → 查表取 exported_fd[buf_idx], 不调 EXPBUF ioctl
+原因:    每帧 EXPBUF 多了内核文件结构体分配 + dma_buf 引用计数操作
+
+生命周期:
+  init:  EXPBUF × 4 → exported_fd[0..3]  ← 一次性操作
+  每帧:  DQBUF → isp_fd = exported_fd[buf_idx] → RGA → QBUF
+  deinit: close(fd[0..3]) → STREAMOFF
+```
+
+### 归还时机
+
+```
+当前 (已优化):
+  ② RGA NV12→RGB 完成 → ③ put_frame 立即归还
+  isp_fd 占用: ~500μs (仅 RGA DMA 读取期间)
+  后面 NPU/画框/LCD/帧传递 全读 arena_fd, 跟 isp_fd 无关
+
+优化前 (已废弃):
+  ② RGA → ... → ⑨ LCD → ⑩ put_frame
+  isp_fd 占用: ~30ms (整帧循环时间)
+  导致 buffer 周转慢, ISP 空等概率增加
+```
+
+### 采集帧率与处理时间
+
+```
+ISP 输出:   30fps (33ms/帧, 硬件固定)
+处理循环:   ~25-30ms/帧
+  RGA NV12→RGB:      ~500μs
+  put_frame:          (立即)
+  YOLO NPU:           ~15ms
+  Face NPU (每3帧):  ~12ms
+  CPU 画框:           ~2ms
+  Motion detect:      ~3ms
+  RGA→BGR:            ~300μs
+  RGA→LCD:            ~300μs
+  usleep(10ms):       10ms (主动限速)
+
+buffer 周转窗口:
+  处理 25-30ms < 4 × 33ms = 132ms (4 buffer 的容错窗口)
+  → 不会丢帧
+```
+
+### 数据流到下游
+
+```
+isp_fd (NV12 450KB) — V4L2 buffer, ⑧ 步后归还
+    ↓ ② RGA fd→fd, ~500μs
+arena_fd (RGB 1.2MB) — Arena CMA, 单 buffer 每帧覆盖
+    ├→ NPU 推理 (只读)
+    ├→ CPU 画框 (只写, NPU 之后)
+    ├→ ② RGA→BGR CMA[0]/[1] (1.2MB×2 = 2.4MB, 双缓冲)
+    └→ ⑨ RGA→LCD CMA (150KB, 单 buffer)
+
+put_frame 归还后 isp_fd 可能被 ISP 覆盖写, 但 arena_fd
+不受影响 — RGA 已经把数据从 isp_fd 搬到了 arena_fd
+```
+
+---
+
 ## 6. 我的项目中使用
 
 | 功能 | 文件 | 行号 |
