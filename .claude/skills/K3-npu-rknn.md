@@ -332,3 +332,101 @@ if (kw_res.detected) {
 - 嵌入式 NPU 架构对比: Rockchip NPU vs Google EdgeTPU vs Intel Movidius
 - INT8 量化深入: Per-tensor vs Per-channel, Symmetric vs Asymmetric
 - `Documentation/devicetree/bindings/npu/rockchip,rk3568-rknpu.yaml`
+
+- 1. 问题根源：rknn_destroy_mem 会触发内核 Oops
+文件头注释直接点明了（npu_memory_reuse.cc:5-7）：
+
+
+// - rknn_destroy_mem on an IO-bound mem triggers rknpu_mem_sync_ioctl
+//   which NULL-derefs in the kernel driver → Oops. Always unbind first:
+//   rknn_set_io_mem(new) replaces old binding → then rknn_destroy_mem(old).
+核心事实：RKNPU 内核驱动的 rknpu_mem_sync_ioctl 内部会解引用 ctx 里绑定的 buffer 指针。如果那个 buffer 已经被销毁了（物理内存释放），这个解引用就是 NULL deref → 内核 Oops → 板端重启。
+
+2. ctx 与 buffer 的绑定关系
+每个模型有一个 rknn_context（ctx），ctx 内部存着当前绑定的 I/O buffer 指针：
+
+
+rknn_init(yolo) 之后:
+┌─ yolo_ctx (内核态) ──────┐
+│  input_buffer  → 0x1e000000 │ ← 指向 YOLO 自己的 DMA buffer
+│  output_buf[0] → 0x1e400000 │
+│  output_buf[1] → 0x1e500000 │
+│  output_buf[2] → 0x1e600000 │
+└────────────────────────────┘
+
+rknn_run(yolo_ctx) 时:
+  内核读 yolo_ctx->input_buffer 得到物理地址 → 让 NPU 从这个地址读
+  NPU 把结果写到 yolo_ctx->output_buf[0..2] 指向的地址
+3. 错误顺序：destroy 在 bind 之前
+
+① rknn_destroy_mem(yolo_ctx, old_input_buffer)
+   → dma_buf_free → CMA 物理内存 0x1e000000 被回收
+   → 但 yolo_ctx->input_buffer 仍然 = 0x1e000000  ← 野指针！
+
+② rknn_set_io_mem(yolo_ctx, arena_input_buffer)
+   → 内核先要解绑旧的 input_buffer
+   → 读 yolo_ctx->input_buffer → 0x1e000000 已释放
+   → NULL deref → Oops → 板端重启
+症状：跑两分钟左右随机重启，dmesg 显示 Unable to handle kernel NULL pointer dereference，在 rknpu_mem_sync_ioctl 里。
+
+4. 正确顺序：bind 在 destroy 之前
+
+// npu_memory_reuse.cc:320-345 (npu_arena_adopt_yolov5)
+
+// ① 先 bind — ctx 指向 Arena 的新 buffer（替换旧绑定）
+rknn_set_io_mem(yolo_ctx, arena->input_mem);         // input → arena
+rknn_set_io_mem(yolo_ctx, arena->output_mems[0]);    // out[0] → arena
+rknn_set_io_mem(yolo_ctx, arena->output_mems[1]);
+rknn_set_io_mem(yolo_ctx, arena->output_mems[2]);
+// 现在 yolo_ctx 内部指针都指向 Arena buffer，安全了
+
+// ② 保存旧 buffer 指针（ctx 已经不指向它们了）
+old_in   = app_ctx->input_mems[0];
+old_out0 = app_ctx->output_mems[0];
+
+// ③ 交换用户态指针 — app_ctx 也指向 Arena
+app_ctx->input_mems[0]  = arena->input_mem;
+app_ctx->output_mems[0] = arena->output_mems[0];
+
+// ④ 现在销毁旧 buffer — 安全！ctx 早就不指向它们了
+rknn_destroy_mem(yolo_ctx, old_in);    // 旧 buffer 的 CMA 回收
+rknn_destroy_mem(yolo_ctx, old_out0);  // 不会触发 Oops
+本质：rknn_set_io_mem(new) 这步完成了两件事——把 ctx 从旧 buffer 重定向到新 buffer，同时隐式解绑旧的。之后旧 buffer 成为"无人引用的孤儿"，销毁它不会碰 ctx。
+
+5. destroy 时的反向保护（对称问题）
+npu_arena_destroy 也有同样的隐患，但方向相反——先 NULL 掉模型的 mem 指针，再销毁 Arena buffer：
+
+
+// npu_memory_reuse.cc:441-467
+
+// ① 先把所有 adopted 模型的 mem 指针置 NULL
+for (每个 slot) {
+    slot->adopted_input_mems[0] = nullptr;      // 模型的 input_mem 指针 = NULL
+    for (每个 output) {
+        slot->adopted_output_mems[i] = nullptr; // 模型的 output_mem 指针 = NULL
+    }
+}
+// 现在模型 release 函数会看到 NULL，跳过 rknn_destroy_mem
+
+// ② 再销毁 Arena 自己的 buffer
+rknn_destroy_mem(primary_ctx, arena->input_mem);
+rknn_destroy_mem(primary_ctx, arena->output_mems[0..2]);
+// 安全 — 没有模型的 ctx 还指向这些 buffer
+如果不先 NULL，模型的 release 函数会在 Arena buffer 已释放后再次 rknn_destroy_mem → 双重释放 → Oops。
+
+6. 完整时序总结
+
+adopt 阶段 (省内存，模型切换到共享 Arena):
+  rknn_set_io_mem(ctx, arena_mem)   ← ① 先 bind 新
+  swap app_ctx 指针                  ← ② 换用户态指针
+  rknn_destroy_mem(ctx, old_mem)    ← ③ 再 destroy 旧
+
+destroy 阶段 (程序退出，回收所有):
+  NULL 所有模型的 mem 指针           ← ① 先断引用
+  rknn_destroy_mem(arena_mem)       ← ② 再销毁 Arena
+
+两个阶段对称：永远是"先建立新引用/断开旧引用，再销毁"
+7. 面试话术
+问：bind-before-destroy 是什么？
+
+答：RKNPU 驱动有个隐含约束——rknn_destroy_mem 在已绑定的 buffer 上操作会触发内核 Oops，因为内核 mem_sync 时解引用 ctx 里存的 buffer 指针。所以切换内存时必须先 rknn_set_io_mem 把 ctx 重定向到新 buffer（隐式解绑旧的），再 rknn_destroy_mem 销毁旧 buffer。销毁整个 Arena 时反过来——先把所有模型指向 Arena 的指针置 NULL，再销毁 Arena buffer，防止双重释放。这个约束驱动源码没文档化，是从 Oops 栈反推出来的。
