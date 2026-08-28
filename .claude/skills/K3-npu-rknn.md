@@ -430,3 +430,29 @@ destroy 阶段 (程序退出，回收所有):
 问：bind-before-destroy 是什么？
 
 答：RKNPU 驱动有个隐含约束——rknn_destroy_mem 在已绑定的 buffer 上操作会触发内核 Oops，因为内核 mem_sync 时解引用 ctx 里存的 buffer 指针。所以切换内存时必须先 rknn_set_io_mem 把 ctx 重定向到新 buffer（隐式解绑旧的），再 rknn_destroy_mem 销毁旧 buffer。销毁整个 Arena 时反过来——先把所有模型指向 Arena 的指针置 NULL，再销毁 Arena buffer，防止双重释放。这个约束驱动源码没文档化，是从 Oops 栈反推出来的。
+
+
+流程说明
+-------------------------------------------------------------------------------------------------------
+阶段一：初始化各模型，各自有默认 buffer
+  yolo_ctx  → yolo 自己的 buffer
+  scrfd_ctx → scrfd 自己的 buffer
+  kws_ctx   → kws 自己的 buffer
+
+阶段二：找最大 → 建 Arena（一块大的共享 buffer）
+  ① 算每个模型需要多大 I/O
+  ② 取最大值，分配一块 Arena
+
+阶段三：adopt —— 把各模型从自己的 buffer 换绑到 Arena  ← bind-before-destroy 在这
+  rknn_set_io_mem(yolo_ctx,  arena)   // 先换绑
+  rknn_destroy_mem(yolo,     yolo旧buffer)  // 再释放旧的
+  // scrfd、kws 同理
+
+阶段四：正常推理 —— 一直用 Arena，不再 destroy
+  rknn_run(yolo_ctx)   // 共用 Arena
+  rknn_run(scrfd_ctx)  // 共用 Arena
+  rknn_run(kws_ctx)    // 共用 Arena
+  // 没有销毁，没有问题
+
+阶段五：退出 —— 反向清理
+  先 NULL 各模型指针 → 再 destroy Arena
