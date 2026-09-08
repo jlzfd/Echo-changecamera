@@ -6,48 +6,50 @@ Linux V4L2 框架下，通过 `VIDIOC_EXPBUF` 将 ISP 驱动的 DMA buffer 导�
 
 ---
 
-CONFIG_VIDEO_SC3336
-    ↓
-编译 sc3336.o
-    ↓
-sensor_mod_init()//需要摄像头快速启动，则通过subsys_initcall(sensor_mod_init)子系统注册调用;不需要，则通过device_initcall_sync(sensor_mod_init)普通设备注册;
-    ↓
-i2c_add_driver()
-    ↓
-DTS compatible="smartsens,sc3336"
-    ↓
-sc3336_probe()
-    ├── 解析 DTS
-    ├── 获取 clock/GPIO/regulator
-    ├── v4l2_i2c_subdev_init()
-    ├── 初始化 controls
-    ├── Sensor 上电
-    ├── I²C 读取 Chip ID 0xCC41
-    ├── media_entity_pads_init()
-    └── v4l2_async_register_subdev_sensor_common()
-            ↓
-    Media Graph 建链
-SC3336 → DPHY → CSI2 → CIF/ISP → /dev/videoX
-            ↓
-用户 VIDIOC_STREAMON
-            ↓
-ISP 启动 pipeline
-            ↓
-sc3336_s_stream(1)
-    ├── Runtime PM 上电
-    ├── 写 2304×1296 模式寄存器
-    ├── 写曝光/增益 controls
-    └── 写 0x0100 = 1
-            ↓
-SC3336 输出 2304×1296 RAW10
-            ↓
-2-Lane MIPI CSI-2
-            ↓
-ISP 处理/缩放
-            ↓
-DMA 写入 V4L2 buffer
-            ↓
-应用 DQBUF
+从驱动到应用
+```mermaid
+flowchart TD
+    A[CONFIG_VIDEO_SC3336] --> B[编译 sc3336.o]
+    B --> C{sensor_mod_init 入口选择}
+    C -->|快速启动: subsys_initcall| D[sensor_mod_init()]
+    C -->|普通启动: device_initcall_sync| D
+
+    D --> E[i2c_add_driver() 注册I2C驱动]
+    E --> F[DTS compatible = "smartsens,sc3336" 设备匹配]
+    F --> G[sc3336_probe()]
+
+    subgraph sc3336_probe
+        G1[解析DTS: clock/GPIO/regulator资源]
+        G2[v4l2_i2c_subdev_init() 初始化subdev]
+        G3[初始化V4L2 controls控件]
+        G4[Sensor硬件上电]
+        G5[I2C读取Chip ID 0xCC41校验芯片]
+        G6[media_entity_pads_init() media实体pad初始化]
+        G7[v4l2_async_register_subdev_sensor_common() 异步注册subdev]
+        G1 --> G2 --> G3 --> G4 --> G5 --> G6 --> G7
+    end
+    G --> G1
+
+    G7 --> H[Media Graph 媒体图建链<br/>SC3336 → DPHY → CSI2 → CIF/ISP → /dev/videoX]
+    H --> I[用户态 VIDIOC_STREAMON 开启流]
+    I --> J[ISP 启动 pipeline流水线]
+    J --> K[sc3336_s_stream(1)]
+
+    subgraph sc3336_s_stream(1)
+        K1[Runtime‑PM 传感器上电]
+        K2[写入2304×1296模式寄存器组]
+        K3[写入曝光、增益controls参数]
+        K4[写寄存器0x0100 = 1 启动sensor输出]
+        K1 --> K2 --> K3 --> K4
+    end
+    J --> K1
+
+    K4 --> L[SC3336输出 2304×1296 RAW10]
+    L --> M[2‑Lane MIPI CSI‑2 传输]
+    M --> N[ISP处理、图像缩放]
+    N --> O[DMA搬运写入V4L2 buffer]
+    O --> P[应用程序 DQBUF 获取图像帧]
+
 
 
 ## 2. 为什么需要它
