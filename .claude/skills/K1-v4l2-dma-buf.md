@@ -6,36 +6,53 @@ Linux V4L2 框架下，通过 `VIDIOC_EXPBUF` 将 ISP 驱动的 DMA buffer 导�
 
 ---
 
+```text
 CONFIG_VIDEO_SC3336
-↓ 编译 sc3336.o
-↓ sensor_mod_init()
- ├─ 需要摄像头快速启动 → subsys_initcall(sensor_mod_init) 子系统注册调用
- └─ 不需要快速启动 → device_initcall_sync(sensor_mod_init) 普通设备注册
-↓ i2c_add_driver()
-↓ DTS compatible="smartsens,sc3336" 设备树匹配
-↓ sc3336_probe()
-  ├─ 解析 DTS，获取 clock / GPIO / regulator 电源时钟资源
-  ├─ v4l2_i2c_subdev_init()
-  ├─ 初始化 V4L2 controls 曝光增益控件
-  ├─ Sensor 硬件上电
-  ├─ I²C 读取 Chip ID 0xCC41，芯片ID校验
-  ├─ media_entity_pads_init() media pad实体初始化
-  └─ v4l2_async_register_subdev_sensor_common() 异步注册subdev
-↓ Media Graph 媒体图建链
-  SC3336 → DPHY → CSI2 → CIF/ISP → /dev/videoX
-↓ 用户态：VIDIOC_STREAMON
-↓ ISP 启动 pipeline图像流水线
-↓ sc3336_s_stream(1)
-  ├─ Runtime PM 传感器上电
-  ├─ 写入2304×1296整套模式寄存器
-  ├─ 写入曝光/增益 controls 参数
-  └─ 写寄存器 0x0100 = 1，开启sensor输出
-↓ SC3336 输出 2304×1296 RAW10
-↓ 2‑Lane MIPI CSI‑2 数据传输
-↓ ISP 图像处理、缩放
-↓ DMA 写入 V4L2 buffer
-↓ 应用程序 DQBUF，拿到图像帧
-
+↓
+编译 sc3336.o
+↓
+sensor_mod_init()
+├─ 需要摄像头快速启动
+│  └─ subsys_initcall(sensor_mod_init)：子系统注册调用
+└─ 不需要快速启动
+   └─ device_initcall_sync(sensor_mod_init)：普通设备注册
+↓
+i2c_add_driver()
+↓
+DTS compatible = "smartsens,sc3336" 设备树匹配
+↓
+sc3336_probe()
+├─ 解析 DTS，获取 clock / GPIO / regulator 电源时钟资源
+├─ v4l2_i2c_subdev_init()
+├─ 初始化 V4L2 controls 曝光增益控件
+├─ Sensor 硬件上电
+├─ I²C 读取 Chip ID 0xCC41，进行芯片 ID 校验
+├─ media_entity_pads_init()：初始化 Media Pad 实体
+└─ v4l2_async_register_subdev_sensor_common()：异步注册 Subdev
+↓
+Media Graph 媒体图建链
+└─ SC3336 → DPHY → CSI2 → CIF/ISP → /dev/videoX
+↓
+用户态调用 VIDIOC_STREAMON
+↓
+ISP 启动 Pipeline 图像流水线
+↓
+sc3336_s_stream(1)
+├─ Runtime PM：传感器上电
+├─ 写入 2304 × 1296 整套模式寄存器
+├─ 写入曝光、增益 Controls 参数
+└─ 写寄存器 0x0100 = 1，开启 Sensor 输出
+↓
+SC3336 输出 2304 × 1296 RAW10
+↓
+2-Lane MIPI CSI-2 数据传输
+↓
+ISP 图像处理、缩放
+↓
+DMA 写入 V4L2 Buffer
+↓
+应用程序调用 DQBUF，取得图像帧
+```
 
 
 
