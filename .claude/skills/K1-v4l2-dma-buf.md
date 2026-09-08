@@ -6,6 +6,50 @@ Linux V4L2 框架下，通过 `VIDIOC_EXPBUF` 将 ISP 驱动的 DMA buffer 导�
 
 ---
 
+CONFIG_VIDEO_SC3336
+    ↓
+编译 sc3336.o
+    ↓
+sensor_mod_init()//需要摄像头快速启动，则通过subsys_initcall(sensor_mod_init)子系统注册调用;不需要，则通过device_initcall_sync(sensor_mod_init)普通设备注册;
+    ↓
+i2c_add_driver()
+    ↓
+DTS compatible="smartsens,sc3336"
+    ↓
+sc3336_probe()
+    ├── 解析 DTS
+    ├── 获取 clock/GPIO/regulator
+    ├── v4l2_i2c_subdev_init()
+    ├── 初始化 controls
+    ├── Sensor 上电
+    ├── I²C 读取 Chip ID 0xCC41
+    ├── media_entity_pads_init()
+    └── v4l2_async_register_subdev_sensor_common()
+            ↓
+    Media Graph 建链
+SC3336 → DPHY → CSI2 → CIF/ISP → /dev/videoX
+            ↓
+用户 VIDIOC_STREAMON
+            ↓
+ISP 启动 pipeline
+            ↓
+sc3336_s_stream(1)
+    ├── Runtime PM 上电
+    ├── 写 2304×1296 模式寄存器
+    ├── 写曝光/增益 controls
+    └── 写 0x0100 = 1
+            ↓
+SC3336 输出 2304×1296 RAW10
+            ↓
+2-Lane MIPI CSI-2
+            ↓
+ISP 处理/缩放
+            ↓
+DMA 写入 V4L2 buffer
+            ↓
+应用 DQBUF
+
+
 ## 2. 为什么需要它
 
 | | 传统 OpenCV 方式 | V4L2 DMA-BUF 零拷贝 |
