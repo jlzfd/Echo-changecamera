@@ -6,6 +6,22 @@
 
 ---
 
+```mermaid
+flowchart LR
+    KWS[KWS线程] --> Q[EventQueue]
+    WS[WebSocket线程] --> Q
+    CAM[摄像头线程] --> Q
+    TTS[TTS播放线程] --> Q
+    HB[心跳线程] --> Q
+    REC[重连线程] --> Q
+
+    Q --> ST[唯一状态机线程]
+    ST --> HE[HandleEvent]
+    HE --> CS[ChangeState]
+    CS --> EX[旧状态Exit]
+    EX --> EN[新状态Enter]
+```
+
 ## 2. 为什么需要它
 
 语音交互不是线性的——用户说话时不能同时检测唤醒词，播放 TTS 时不能同时录音做 ASR。状态机确保任何时候只有一个活跃状态，状态切换清晰可控。
