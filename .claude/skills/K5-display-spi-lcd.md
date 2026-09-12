@@ -6,6 +6,16 @@ ST7789V SPI 屏通过内核 fbtft 驱动注册为 `/dev/fb0`，RGA 硬件将 Are
 
 ---
 
+内核匹配spi驱动 → fbtft_driver_probe_spi()
+    → fbtft_probe_common()
+        解析DTS、分配fb_info + fbtft_par
+        根据buswidth/regwidth绑定底层SPI读写函数
+        merge fbtftops：把st7789v的init_display/set_var挂到par
+        fbtft_register_framebuffer(info)
+            → par->fbtftops.init_display(par) // ST7789初始化屏
+            → register_framebuffer() 注册fb子系统，生成/dev/fbX
+
+
 ## 2. 为什么需要它
 
 RV1106 无 MIPI DSI/并口 RGB，只能用 SPI 屏。传统 CPU 路径每帧 ~2MB memcpy：
