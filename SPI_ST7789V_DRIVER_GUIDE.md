@@ -19,6 +19,52 @@
 
 因此，本文所说的“新驱动”并没有自动替换旧驱动。最终由 DTB 中 LCD 节点的 `compatible` 决定绑定哪一个驱动。
 
+
+                        Linux SPI 驱动完整流程
+                                 │
+                    ┌────────────┴────────────┐
+                    │                         │
+                 设备侧                     驱动侧
+                    │                         │
+                   DTS                st7789v_rga.c
+                    │                         │
+                   dtc              module_spi_driver()
+                    │                         │
+                   DTB                module_driver()
+                    │                         │
+              Bootloader                   module_init
+                    │                         │
+                    │              ┌──────────┴──────────┐
+                    │              │                     │
+                    │             =y                    =m
+                    │              │                     │
+                    │         __initcall           init_module
+                    │              │                alias
+                    │         do_initcalls              │
+                    │              │              insmod/modprobe
+                    │              │                     │
+                    │              └──────────┬──────────┘
+                    │                         │
+                    │                spi_register_driver
+                    │                         │
+                    ▼                         ▼
+            struct spi_device         struct spi_driver
+                    │                         │
+                    └────────────┬────────────┘
+                                 │
+                              SPI BUS
+                                 │
+                              match()
+                                 │
+                  compatible ↔ of_match_table
+                                 │
+                            匹配成功
+                                 │
+                                 ▼
+                 st7789v_rga_probe(spi)
+                                 │
+                       真正初始化硬件
+
 ## 2. 修改目标
 
 旧链路主要是：
