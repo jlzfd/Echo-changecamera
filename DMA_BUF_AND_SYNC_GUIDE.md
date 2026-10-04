@@ -234,7 +234,222 @@ ACQUIRE取得FREE LCD Buffer
 
 不应为了“用了高级机制”而引入Fence。当前单路、latest-only、低并发链路中，同步调用与严格所有权更简单，也更容易验证。
 
-## 12. 常见错误
+## 12. 内存对齐与stride
+
+DMA场景里的“对齐”不是一个概念，而是至少包含四层：
+
+| 层次 | 含义 | 不满足时的后果 |
+|---|---|---|
+| 地址对齐 | Buffer起始DMA地址满足硬件要求 | DMA拒绝、性能下降或总线异常 |
+| 分配粒度 | 页/CMA/IOMMU映射通常按页管理 | 映射范围扩大，尾部存在padding |
+| 行对齐 | 每行实际跨度`stride`可能大于有效宽度 | 图像倾斜、错色、越界 |
+| Tensor对齐 | RKNN真实内存按`size_with_stride`分配 | NPU输出截断或写越界 |
+
+### 12.1 width、stride和size不是一回事
+
+以RGB888为例：
+
+```text
+有效行字节 = width × 3
+实际行字节 = width_stride × 3
+Buffer大小至少 = 实际行字节 × height_stride
+```
+
+如果硬件要求每行16字节对齐，可表示为：
+
+```c
+stride_bytes = ALIGN(width * bytes_per_pixel, 16);
+```
+
+CPU逐行访问时必须使用真实stride：
+
+```c
+row = base + y * stride_bytes;
+pixel = row + x * bytes_per_pixel;
+```
+
+不能默认使用`width * bytes_per_pixel`跨行，否则只要出现padding，第二行开始就会错位。
+
+### 12.2 常见图像格式大小
+
+在无额外padding时：
+
+```text
+NV12    = width × height × 3 / 2
+RGB888  = width × height × 3
+RGB565  = width × height × 2
+```
+
+但驱动返回的`bytesperline`、`sizeimage`、LCD UAPI中的`stride`以及RKNN的`size_with_stride`优先级更高。真实分配不能只按理论有效像素计算。
+
+项目V4L2初始化会记录驱动协商后的stride和size；RGA结构则显式保存`width_stride/height_stride`。LCD侧由驱动返回字节stride，RGB565转换时应用使用`info.stride / 2`得到像素stride。
+
+### 12.3 RKNN必须使用size_with_stride
+
+项目NPU Arena不是只使用tensor逻辑尺寸，而是比较和分配：
+
+```cpp
+input_attrs[i].size_with_stride
+output_attrs[i].size_with_stride
+```
+
+原因是NPU内部可能对W、H或C进行硬件对齐。逻辑元素数量计算出的size可能小于真实写入范围。正确原则是：
+
+```text
+分配大小 >= size_with_stride
+绑定属性与实际模型tensor一致
+模型切换前重新校验每个输入输出上限
+```
+
+项目通过Arena记录所有模型的最大输入和各输出最大值，再预分配共享内存。这既减少反复申请释放，也避免较大模型写穿较小Buffer。
+
+### 12.4 对齐不等于物理连续
+
+页对齐、Cache line对齐和物理连续是不同属性：
+
+- CMA通常可提供物理连续内存；
+- SG Buffer可以由多个物理段组成；
+- IOMMU可以把离散物理页映射成连续IOVA；
+- 起始地址对齐并不能证明整个Buffer物理连续；
+- fd更不能反推出连续物理地址。
+
+## 13. DMA场景下的线程安全
+
+线程安全要同时保护三类对象：
+
+```text
+CPU状态：index、busy、job_pending、引用计数
+Buffer内容：谁正在读、谁正在写
+硬件上下文：RGA/NPU绑定、提交队列、模型Arena
+```
+
+### 13.1 锁只保护CPU临界区
+
+例如：
+
+```cpp
+pthread_mutex_lock(&worker.job_mutex);
+if (!worker.busy) {
+    worker.busy = true;
+    submit = true;
+}
+pthread_mutex_unlock(&worker.job_mutex);
+```
+
+它保证两个CPU线程不会同时认领staging Buffer，但它本身不能证明RGA或NPU已经完成DMA。硬件完成仍由同步API返回、IRQ完成事件或Fence保证。
+
+### 13.2 当前项目的锁职责
+
+| 锁/状态 | 保护对象 | 不能替代什么 |
+|---|---|---|
+| `job_mutex + busy/job_pending` | staging任务的生产消费状态 | RGA/NPU硬件完成 |
+| `result_mutex` | 检测结果结构的跨线程复制 | DMA Cache同步 |
+| `npu_arena_lock()` | Arena写入、IO绑定和推理的原子序列 | 多Buffer流水调度 |
+| `pic_buf_mutex` | 图片Buffer的应用层访问 | V4L2 QBUF/DQBUF所有权 |
+| LCD Buffer状态机 | FREE到IN_FLIGHT生命周期 | CPU Cache维护 |
+| `running_mutex` | 相机启动停止和全局资源生命周期 | 单帧DMA完成 |
+
+### 13.3 正确的所有权状态机
+
+推荐每个共享Buffer都有明确状态：
+
+```text
+FREE
+  → PRODUCER_WRITING
+  → READY
+  → CONSUMER_READING
+  → FREE
+```
+
+如果是异步硬件，还需要把完成条件放入状态转换：
+
+```text
+RGA_SUBMITTED
+  → RGA fence/complete
+  → NPU_READY
+```
+
+禁止仅因为“已经调用提交函数”就把Buffer标成FREE。提交成功只说明任务进入队列，不一定说明硬件完成。
+
+### 13.4 互斥锁、原子变量和内存屏障
+
+- 互斥锁适合保护多个相关字段和复合状态转换；
+- 原子变量适合单个停止标志或计数器；
+- 条件变量必须和谓词一起在循环中检查，防止虚假唤醒；
+- CPU内存屏障只约束CPU访存顺序，不能代替DMA API的设备同步；
+- 驱动中访问MMIO和DMA描述符时应使用内核提供的`readl/writel`、DMA API和相应barrier，不能只靠C/C++ `volatile`。
+
+## 14. 一致性的完整闭环
+
+一次正确的Buffer交接应同时回答四个问题：
+
+```text
+1. 所有权：当前谁可以访问？
+2. 完成性：前一个CPU/硬件任务结束了吗？
+3. 可见性：新数据对下一个访问者可见吗？
+4. 布局：双方对format、stride、offset、size理解一致吗？
+```
+
+以RGA写、CPU画框、LCD读取为例：
+
+```text
+RGA同步返回                     // 完成性
+  → DMA_BUF_SYNC_START          // 对CPU可见
+  → CPU按真实stride画框          // 布局正确
+  → DMA_BUF_SYNC_END            // 对设备可见
+  → ACQUIRE/QUEUE状态切换        // 所有权
+  → SPI完成回调后恢复FREE        // 生命周期
+```
+
+少任何一环都可能表现为偶现问题：
+
+- 缺所有权：并发覆盖、撕裂；
+- 缺完成等待：读取半帧；
+- 缺Cache同步：读到旧数据；
+- stride/size错误：花屏、越界；
+- 生命周期错误：use-after-free或fd泄漏。
+
+## 15. DMA内存生命周期和错误路径
+
+建议把生命周期成对检查：
+
+```text
+alloc       ↔ free
+dma_buf_get ↔ dma_buf_put
+attach      ↔ detach
+map         ↔ unmap
+mmap        ↔ munmap
+DQBUF       ↔ QBUF
+ACQUIRE     ↔ QUEUE或CANCEL
+lock        ↔ unlock
+```
+
+当前项目尤其要保证：
+
+- RGA失败时仍归还V4L2 Buffer；
+- ACQUIRE后转换失败必须CANCEL LCD Buffer；
+- NPU停止前先停止新任务并join工作线程；
+- 硬件仍在使用时不能close最后一个fd或释放Arena；
+- 部分初始化失败时按逆序释放已成功资源。
+
+## 16. 项目中的DMA数据链总图
+
+```text
+Sensor/ISP
+  → VB2采集Buffer
+  → VIDIOC_EXPBUF得到dma-buf fd
+  → DQBUF取得所有权
+  → RGA导入fd并读取NV12
+  → RGA写CMA RGB Buffer
+       ├→ CPU Cache同步后画框
+       ├→ staging Buffer → NPU Arena → RKNN
+       └→ RGA RGB565 → LCD双缓冲 → SPI DMA
+  → 各消费者完成
+  → QBUF归还Camera Buffer
+```
+
+
+## 17. 常见错误
 
 ### 把fd当物理地址
 
@@ -256,7 +471,7 @@ ACQUIRE取得FREE LCD Buffer
 
 错误。驱动可能仍持有attachment或任务引用。必须先完成/取消任务，再释放生命周期引用。
 
-## 13. 调试方法
+## 18. 调试方法
 
 优先记录每个Buffer的：
 
@@ -279,7 +494,7 @@ frame_id
 | LCD延迟持续增大 | 排队旧帧而非latest-only |
 | fd持续增加 | `dma_buf_get/put`或导出fd生命周期泄漏 |
 
-## 14. 项目源码索引
+## 19. 项目源码索引
 
 ```text
 V4L2所有权：
