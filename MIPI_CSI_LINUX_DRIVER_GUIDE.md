@@ -16,6 +16,57 @@ Memory存储:           YUV图像 → 内存Buffer地址
 ↓
 应用程序:             读取内存 → 显示/编码/分析
 
+第一阶段：设备树产生设备
+DTS camera@30
+    ↓
+I²C core创建struct i2c_client
+    ↓
+compatible匹配sc3336_i2c_driver
+
+第二阶段：总线驱动绑定
+module_i2c_driver(sc3336_i2c_driver)
+    ↓
+sc3336_probe(client)
+    ↓
+获得clock、GPIO、regulator
+    ↓
+读取Sensor ID
+    ↓
+证明I²C通信和Sensor型号正确
+
+第三阶段：注册多媒体子设备
+初始化struct v4l2_subdev
+    ↓
+初始化media_entity和source pad
+    ↓
+注册v4l2_ctrl_handler
+    ↓
+注册异步v4l2_subdev
+
+第四阶段：组建摄像头拓扑
+V4L2 async notifier匹配endpoint
+    ↓
+Sensor → D-PHY → CSI → CIF → ISP
+    ↓
+建立Media pipeline
+
+第五阶段：应用使用
+应用打开/dev/videoX
+    ↓
+配置格式和buffer
+    ↓
+STREAMON
+    ↓
+框架启动ISP/CIF/CSI/Sensor
+    ↓
+Sensor通过MIPI输出RAW
+    ↓
+ISP处理
+    ↓
+DMA写入V4L2 buffer
+    ↓
+应用DQBUF获得图像
+
 ## 1. 先回答：MIPI 传多少字节
 
 答案取决于 sensor 当前 mode，而不是应用请求的最终图像尺寸。
